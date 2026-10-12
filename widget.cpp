@@ -21,6 +21,11 @@
 #include <QTimerEvent>
 #include <QTextStream>
 #include <QThread>
+#include <QElapsedTimer>
+#include <QCheckBox>
+#include <QElapsedTimer>
+#include <QDebug>
+#include <QtGlobal>
 
 Widget::Widget(QWidget *parent)
     : QWidget(parent), ui(new Ui::Widget), four_way(new FourWayIF), RL(new BF_ROOTLOADER),
@@ -31,6 +36,33 @@ Widget::Widget(QWidget *parent)
       eeprom_buffer(new QByteArray),
       music_buffer(new QByteArray) {
   ui->setupUi(this);
+  // V19 bootloader keepalive workaround
+  m_keepAliveTimer = new QTimer(this);
+  m_keepAliveTimer->setInterval(3000);
+  m_keepAliveTimer->setSingleShot(true);
+
+  connect(m_keepAliveTimer, &QTimer::timeout,
+          this, &Widget::sendKeepAlive);
+
+  connect(ui->keepAliveCheckBox, &QCheckBox::toggled,
+          this, [this](bool enabled) {
+
+            if (!enabled) {
+              m_keepAliveTimer->stop();
+              qInfo() << "[KEEPALIVE] Disabled";
+              return;
+            }
+
+            if (m_serial->isOpen() &&
+                !four_way->direct &&
+                four_way->passthrough_started &&
+                four_way->ESC_connected &&
+                !four_way->ack_required) {
+
+              m_keepAliveTimer->start();
+              qInfo() << "[KEEPALIVE] Enabled";
+            }
+          });
   // ui->tabWidget->removeTab(4); // todo make these visible
   ui->tabWidget->removeTab(5);  // remove led tab for now
   this->setWindowTitle("ESC Config Tool 1.97 - For firmware version 2.21 and higher");
@@ -426,6 +458,7 @@ void Widget::connectSerial() {
 }
 
 void Widget::on_disconnectButton_clicked() {
+  m_keepAliveTimer->stop();
   if (m_serial->isOpen()) {
     hide4wayButtons(true);
     hideESCSettings(true);
@@ -800,6 +833,7 @@ void Widget::resetESC() {
 void Widget::on_loadBinary_clicked() { loadBinFile(); }
 
 void Widget::on_writeBinary_clicked() {
+  m_keepAliveTimer->stop();
   uint16_t chunk_size = 128;
 
   if (four_way->ESC_connected == false) {
@@ -985,6 +1019,8 @@ void Widget::on_writeBinary_clicked() {
 }
 
 bool Widget::getMusic() {
+  QElapsedTimer musicTimer;
+
   four_way->ack_required = true;
   if (four_way->direct) {
     writeData(RL->setAddress(four_way->eeprom_address + 48));
@@ -1020,14 +1056,23 @@ bool Widget::getMusic() {
       music_buffer->append(music[i]);
     }
   } else {
+    uint32_t musicAddress =  four_way->eeprom_address +
+        (four_way->memory_divider_required_four ? 12 : 48);
+    qInfo() << "[MUSIC] Read address:"
+            << Qt::hex << musicAddress;
+    musicTimer.start();
+    qInfo() << "[MUSIC] Read started";
     while (four_way->ack_required) {
       writeData(
-          four_way->makeFourWayReadCommand(128, four_way->eeprom_address + 48));
+          four_way->makeFourWayReadCommand(128, musicAddress));
       m_serial->waitForBytesWritten(500);
-      while (m_serial->waitForReadyRead(1000)) {
+      while (m_serial->waitForReadyRead(100)) {
       }
 
       readData();
+      qInfo() << "[MUSIC] Response processed:"
+              << musicTimer.elapsed() << "ms"
+              << "ACK required:" << four_way->ack_required;
     }
     if ((uint8_t)input_buffer->at(0) == 0xFF) {
       musicBufferFull = false;
@@ -1073,6 +1118,7 @@ bool Widget::writeMusic() {
 }
 
 void Widget::on_VerifyFlash_clicked() {
+  m_keepAliveTimer->stop();
   QFile inputFile(filename);
   inputFile.open(QIODevice::ReadOnly);
 
@@ -1142,7 +1188,7 @@ void Widget::endTimer() {
 
 bool Widget::connectMotor(uint8_t motor) {
   uint16_t buffer_length = 48;
-
+  m_keepAliveTimer->stop();
   ui->escStatusLabel->setText("Connecting to ESC...");
   ui->escStatusLabel_2->setText("Connecting to ESC...");
   QApplication::processEvents();
@@ -1335,6 +1381,19 @@ bool Widget::connectMotor(uint8_t motor) {
     if (!four_way->direct) {
       getMusic();
     }
+    if (!four_way->direct) {
+
+      four_way->connected_motor = motor;
+
+      if (ui->keepAliveCheckBox->isChecked()) {
+        m_keepAliveTimer->start();
+
+        qInfo() << "[KEEPALIVE] Started for motor"
+                << (motor + 1);
+      }
+    }
+
+    return true;
     return true;
 
   } else {
@@ -1570,6 +1629,7 @@ void Widget::sendDirect(const QByteArray sendbuffer, uint16_t buffer_size,
 void Widget::on_writeEEPROM_2_clicked() { on_writeEEPROM_clicked(); }
 
 void Widget::on_writeEEPROM_clicked() {
+  m_keepAliveTimer->stop();
   four_way->ack_required = true;
   QByteArray eeprom_out = buildBufferFromUi(*eeprom_buffer);
 
@@ -1589,6 +1649,13 @@ void Widget::on_writeEEPROM_clicked() {
     if (four_way->ack_required == false) {  // good ack received from esc
       ui->escStatusLabel->setText("WRITE EEPROM SUCCESSFUL");
       writeMusic();
+      if (!four_way->direct &&
+          !four_way->ack_required &&
+          four_way->ESC_connected &&
+          ui->keepAliveCheckBox->isChecked()) {
+        m_keepAliveTimer->start();
+        qInfo() << "[KEEPALIVE] Timer restarted after Save";
+      }
     }
   }
 }
@@ -1662,6 +1729,7 @@ void Widget::on_devSettings_stateChanged(int arg1) {
 }
 
 void Widget::on_endPassthrough_clicked() {
+  m_keepAliveTimer->stop();
   hide4wayButtons(true);
   hideESCSettings(true);
   hideEEPROMSettings(true);
@@ -1840,6 +1908,97 @@ void Widget::sendMSPThrottle() {
 
   if (ui->checkBox->isChecked()) {
     send_mspCommand(0xd6, sliderThrottle);
+  }
+}
+void Widget::sendKeepAlive()
+{
+  // Only operate during a valid four-way session.
+  if (!ui->keepAliveCheckBox->isChecked() ||
+      !m_serial->isOpen() ||
+      four_way->direct ||
+      !four_way->passthrough_started ||
+      !four_way->ESC_connected ||
+      four_way->ack_required) {
+    return;
+  }
+
+          // Do not consume bytes from another transaction.
+  if (m_serial->bytesAvailable() != 0) {
+    qWarning() << "[KEEPALIVE] Unexpected RX data; stopped";
+    m_keepAliveTimer->stop();
+    ui->keepAliveCheckBox->setChecked(false);
+    return;
+  }
+
+          // Read one byte at the current ESC's EEPROM base.
+          // For G431, 0x7E00 is already in bootloader address units.
+  const QByteArray command =
+      four_way->makeFourWayReadCommand(
+          1, four_way->eeprom_address);
+
+  qInfo() << "[KEEPALIVE] TX:"
+          << command.toHex(' ');
+
+  writeData(command);
+
+  if (!m_serial->waitForBytesWritten(200)) {
+    qWarning() << "[KEEPALIVE] TX timeout";
+    m_keepAliveTimer->stop();
+    ui->keepAliveCheckBox->setChecked(false);
+    return;
+  }
+
+          // Collect the complete response without calling readData().
+          // Response: header(5) + data(1) + ACK(1) + CRC(2)
+  QByteArray response;
+
+  QElapsedTimer timeout;
+  timeout.start();
+
+  while (response.size() < 9 && timeout.elapsed() < 350) {
+
+    response.append(m_serial->readAll());
+
+    if (response.size() >= 9)
+      break;
+
+    const int remaining =
+        350 - static_cast<int>(timeout.elapsed());
+
+    if (remaining <= 0)
+      break;
+
+    m_serial->waitForReadyRead(qMin(remaining, 100));
+  }
+
+  const bool valid =
+      response.size() == 9 &&
+      static_cast<quint8>(response.at(0)) == 0x2E &&
+      static_cast<quint8>(response.at(1)) == 0x3A &&
+      static_cast<quint8>(response.at(4)) == 0x01 &&
+      static_cast<quint8>(response.at(6)) == 0x00 &&
+      four_way->checkCRC(response, response.size());
+
+  if (valid) {
+
+    qInfo() << "[KEEPALIVE] OK:"
+            << response.toHex(' ');
+
+            // Begin another three-second inactivity period.
+    m_keepAliveTimer->start();
+
+  } else {
+
+    qWarning() << "[KEEPALIVE] Failed:"
+               << response.toHex(' ');
+
+    m_keepAliveTimer->stop();
+    ui->keepAliveCheckBox->setChecked(false);
+
+    four_way->ESC_connected = false;
+
+    ui->StatusLabel->setText(
+        "Keepalive lost - reconnect ESC");
   }
 }
 void Widget::on_m1MSPSlider_valueChanged(int value) {

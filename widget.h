@@ -7,6 +7,7 @@
 #include <QComboBox>
 #include <functional>
 #include <vector>
+#include <QTimer>
 
 class OutConsole;
 class FourWayIF;
@@ -234,6 +235,7 @@ class Widget : public QWidget {
   //    void initActionsConnections();
 
  private:
+  QTimer *m_keepAliveTimer = nullptr;
   Ui::Widget *ui;
   std::vector<EepromField> eepromFieldTable();
   void applyBufferToUi(const QByteArray &buffer);
@@ -260,6 +262,7 @@ class Widget : public QWidget {
   bool getMusic();
   bool writeMusic();
   void endTimer();
+  void sendKeepAlive();
   typedef union __attribute__((packed)) {
     uint8_t bytes[2];
     uint16_t word;
