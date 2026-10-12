@@ -1210,6 +1210,15 @@ bool Widget::connectMotor(uint8_t motor) {
     }
 
   } else {
+    const QByteArray mspAck =
+        QByteArray::fromHex("244D3E01F504F0");
+
+    if (m_serial->bytesAvailable() >= mspAck.size() &&
+        m_serial->peek(mspAck.size()) == mspAck) {
+
+      qInfo() << "[MSP] Removing stale passthrough ACK";
+      m_serial->read(mspAck.size());
+    }
     four_way->ack_required = true;
     writeData(four_way->makeFourWayCommand(0x37, motor));
     m_serial->waitForBytesWritten(200);
@@ -1225,9 +1234,11 @@ bool Widget::connectMotor(uint8_t motor) {
     }
 
     four_way->ack_required = true;
+    uint32_t readAddress = four_way->eeprom_address -
+        (four_way->memory_divider_required_four ? 8 : 32);
     while (four_way->ack_required) {
       writeData(four_way->makeFourWayReadCommand(buffer_length + 32,
-                                                 four_way->eeprom_address - 32));
+                                                 readAddress));
       m_serial->waitForBytesWritten(300);
       while (m_serial->waitForReadyRead(300)) {
       }
