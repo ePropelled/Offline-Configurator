@@ -305,7 +305,7 @@ QByteArray Widget::buildBufferFromUi(const QByteArray &base) {
   return out;
 }
 
-void Widget::on_sendButton_clicked() {  qInfo() << "SEND BUTTON CLICKED";connectSerial(); }
+void Widget::on_sendButton_clicked() { connectSerial(); }
 
 void Widget::closeSerialPort() {
   if (m_serial->isOpen())
@@ -368,20 +368,9 @@ void Widget::serialInfoStuff() {
 }
 
 void Widget::connectSerial() {
-  qInfo() << "connectSerial entry:"
-          << "port open =" << m_serial->isOpen();
-
-  if (m_serial->isOpen()) {
-    qWarning() << "Serial already open; skipping connection";
-    return;
-  }
-  qInfo() << "checkBox_2 checked:"
-          << ui->checkBox_2->isChecked();
-  qInfo() << "========== CONNECT SERIAL ==========";
   if (ui->checkBox_2->isChecked()) {
     four_way->direct = true;
     m_serial->setBaudRate(m_serial->Baud19200);
-    qInfo() << "DIRECT MODE ENABLED";
     if (ui->tabWidget->count() == 5) {
       ui->tabWidget->removeTab(2);
       showSingleMotor(true);
@@ -392,7 +381,6 @@ void Widget::connectSerial() {
     showSingleMotor(false);
     four_way->direct = false;
     m_serial->setBaudRate(m_serial->Baud115200);
-     qInfo() << "FC PASSTHROUGH MODE ENABLED";
   }
 
   m_serial->setPortName(ui->serialSelectorBox->currentText());
@@ -427,36 +415,7 @@ void Widget::connectSerial() {
       }
       readData();
       send_mspCommand(0xf5, passthroughenable2);
-      bool sent = m_serial->waitForBytesWritten(200);
-
-      QByteArray reply;
-
-      if (m_serial->waitForReadyRead(300)) {
-        reply.append(m_serial->readAll());
-
-        while (m_serial->waitForReadyRead(20)) {
-          reply.append(m_serial->readAll());
-        }
-      }
-
-      qInfo() << "===== FC PASSTHROUGH INIT =====";
-      qInfo() << "MSP 0xF5 sent:" << sent;
-      qInfo() << "MSP 0xF5 RX:" << reply.toHex(' ');
-      // if (!four_way->direct && sent) {
-
-      //   qInfo() << "Scheduling AUTO M1";
-
-      //   QTimer::singleShot(300, this, [this]() {
-
-      //     if (!m_serial->isOpen() || four_way->direct)
-      //       return;
-
-      //     qInfo() << "AUTO M1 START";
-
-      //     on_initMotor1_clicked();
-      //   });
-      // }
-      qInfo() << "================================";
+      m_serial->waitForBytesWritten(100);
     }
 
   } else {
@@ -471,59 +430,7 @@ void Widget::on_disconnectButton_clicked() {
     hide4wayButtons(true);
     hideESCSettings(true);
     hideEEPROMSettings(true);
-    // Reset M1 ESC before leaving Betaflight passthrough.
-    if (!four_way->direct && four_way->ESC_connected) {
-
-      QByteArray resetCmd =
-          four_way->makeFourWayCommand(0x35, 0x00);
-
-      qInfo() << "===== ESC RESET =====";
-      qInfo() << "RESET TX:" << resetCmd.toHex(' ');
-
-      writeData(resetCmd);
-      m_serial->waitForBytesWritten(300);
-
-      QByteArray resetReply;
-
-      if (m_serial->waitForReadyRead(500)) {
-        resetReply.append(m_serial->readAll());
-
-        while (m_serial->waitForReadyRead(20)) {
-          resetReply.append(m_serial->readAll());
-        }
-      }
-
-      qInfo() << "RESET RX:" << resetReply.toHex(' ');
-
-      bool resetAck =
-          resetReply.size() == 9 &&
-          resetReply[0] == char(0x2E) &&
-          resetReply[1] == char(0x35) &&
-          resetReply[6] == char(0x00) &&
-          four_way->checkCRC(resetReply, resetReply.size());
-
-      qInfo() << "RESET ACK VALID:" << resetAck;
-    }
-    QByteArray exitCmd =
-        four_way->makeFourWayCommand(0x34, 0x00);
-
-    qInfo() << "===== EXIT 4WAY =====";
-    qInfo() << "EXIT TX:" << exitCmd.toHex(' ');
-
-    writeData(exitCmd);
-    m_serial->waitForBytesWritten(300);
-
-    QByteArray exitReply;
-
-    if (m_serial->waitForReadyRead(500)) {
-      exitReply.append(m_serial->readAll());
-
-      while (m_serial->waitForReadyRead(20)) {
-        exitReply.append(m_serial->readAll());
-      }
-    }
-
-    qInfo() << "EXIT RX:" << exitReply.toHex(' ');
+    writeData(four_way->makeFourWayCommand(0x34, 0x00));
     m_serial->waitForBytesWritten(500);
     while (m_serial->waitForReadyRead(500)) {
       QByteArray data = m_serial->readAll();
@@ -621,15 +528,7 @@ void Widget::readData() {
             ui->StatusLabel->setText("GOOD ACK FROM IF");
             if (data[1] == (char)0x3a) {
               //  if verifying flash
-              qInfo() << "===== EEPROM READ RESPONSE =====";
-              qInfo() << "RX:" << data.toHex(' ');
-              qInfo() << "ADDRESS:"
-                      << Qt::hex
-                      << ((uint8_t)data[2] * 256 + (uint8_t)data[3]);
-              qInfo() << "LENGTH:"
-                      << Qt::dec
-                      << (uint8_t)data[4];
-              qInfo() << "================================";
+
               input_buffer->clear();
               for (int i = 0; i < (uint8_t)data[4]; i++) {
                 input_buffer->append(
@@ -649,13 +548,6 @@ void Widget::readData() {
               // qInfo("ID 6: %d",data[6]);
               if (data[6] == (char)0x2b) {
                 qInfo("G071ESC_2KB_PAGE");
-                qInfo() << "===== DEVICE INIT RESPONSE =====";
-                qInfo() << "RX:" << data.toHex(' ');
-                qInfo() << "DEVICE ID BYTE:"
-                        << Qt::hex
-                        << (unsigned char)data[6];
-                qInfo() << "================================";
-
                 four_way->memory_divider_required_four = true;
                 four_way->eeprom_address =
                     0x7e00;  // this equals an eeprom address of 0x1f800 126kb
@@ -687,14 +579,6 @@ void Widget::readData() {
             }
           } else {  // bad ack
             qInfo("line 319");
-            qInfo() << "RX HEX:" << data.toHex(' ');
-            qInfo() << "RX LENGTH:" << data.size();
-
-            qInfo("ACK VALUE: 0x%02X",
-                  static_cast<unsigned char>(data[data.size() - 3]));
-
-            qInfo("COMMAND: 0x%02X",
-                  static_cast<unsigned char>(data[1]));
             if (data[1] == (char)0x37) {
               hideESCSettings(true);
               four_way->ESC_connected = false;
@@ -1259,14 +1143,10 @@ void Widget::endTimer() {
 bool Widget::connectMotor(uint8_t motor) {
   uint16_t buffer_length = 48;
 
-  qInfo() << "========================";
-  qInfo() << "CONNECT MOTOR CALLED";
-  qInfo() << "DIRECT MODE:" << four_way->direct;
-  qInfo() << "========================";
   ui->escStatusLabel->setText("Connecting to ESC...");
   ui->escStatusLabel_2->setText("Connecting to ESC...");
   QApplication::processEvents();
-  qInfo() << "DIRECT MODE:" << four_way->direct;
+
   four_way->ack_required = true;
   retries = 0;
   //   while(four_way->ack_required){
@@ -1277,41 +1157,18 @@ bool Widget::connectMotor(uint8_t motor) {
     for (int i = 0; i < 21; i++) {
       BootInit.append(init[i]);
     }
-    //writeData(BootInit);
-    //m_serial->waitForBytesWritten(500);
-    //while (m_serial->waitForReadyRead(500)) {
-    //}
-    //readInitData();
-    qInfo() << "===== DIRECT BOOTLOADER INIT =====";
-    qInfo() << "Serial open:" << m_serial->isOpen();
-    qInfo() << "Baud rate:" << m_serial->baudRate();
-    qInfo() << "TX:" << BootInit.toHex(' ');
-
     writeData(BootInit);
-
-    bool writeOK = m_serial->waitForBytesWritten(500);
-    qInfo() << "Write completed:" << writeOK;
-
+    m_serial->waitForBytesWritten(500);
     while (m_serial->waitForReadyRead(500)) {
-      qInfo() << "RX data available:"
-              << m_serial->bytesAvailable();
     }
-
-    qInfo() << "Buffered RX bytes:"
-            << m_serial->bytesAvailable();
-
     readInitData();
-
-    qInfo() << "ESC connected:"
-            << four_way->ESC_connected;
-    qInfo() << "================================";
     if (four_way->ESC_connected == false) {
       qInfo("not connected");
       ui->escStatusLabel->setText("Can Not Connect");
       ui->escStatusLabel_2->setText("Can Not Connect");
       return false;
     }
-    writeData(RL->setAddress(four_way->eeprom_address - (four_way->memory_divider_required_four ? 8 : 32)));
+    writeData(RL->setAddress(four_way->eeprom_address - 32));
     m_serial->waitForBytesWritten(500);
     while (m_serial->waitForReadyRead(500)) {
     }
@@ -1353,18 +1210,8 @@ bool Widget::connectMotor(uint8_t motor) {
     }
 
   } else {
-    //four_way->ack_required = true;
-    //writeData(four_way->makeFourWayCommand(0x37, motor));
     four_way->ack_required = true;
-
-    QByteArray initCommand =
-        four_way->makeFourWayCommand(0x37, motor);
-
-    qInfo() << "===== ESC INIT REQUEST =====";
-    qInfo() << "Motor index:" << motor;
-    qInfo() << "TX HEX:" << initCommand.toHex(' ');
-
-    writeData(initCommand);
+    writeData(four_way->makeFourWayCommand(0x37, motor));
     m_serial->waitForBytesWritten(200);
     while (m_serial->waitForReadyRead(200)) {
     }
@@ -1380,7 +1227,7 @@ bool Widget::connectMotor(uint8_t motor) {
     four_way->ack_required = true;
     while (four_way->ack_required) {
       writeData(four_way->makeFourWayReadCommand(buffer_length + 32,
-                                                 four_way->eeprom_address - (four_way->memory_divider_required_four ? 8 : 32)));
+                                                 four_way->eeprom_address - 32));
       m_serial->waitForBytesWritten(300);
       while (m_serial->waitForReadyRead(300)) {
       }
@@ -1411,14 +1258,6 @@ bool Widget::connectMotor(uint8_t motor) {
   name.append(QChar(input_buffer->at(14)));
   ui->FirmwareNameLabel->setText(name);
 
-  qInfo() << "===== EEPROM RAW DATA =====";
-  qInfo() << "Buffer length:" << input_buffer->size();
-  qInfo() << "Raw buffer:" << input_buffer->toHex(' ');
-
-  if (input_buffer->size() < 35) {
-    qWarning() << "Unexpected buffer length";
-    return false;
-  }
   input_buffer->remove(0, 32);
   qInfo("inputBUFFERAT0 : %d ", input_buffer->at(0));
 
@@ -1483,8 +1322,7 @@ bool Widget::connectMotor(uint8_t motor) {
     }
     ui->escStatusLabel_2->setText("Connected");
     if (!four_way->direct) {
-      //getMusic();
-      qInfo() << "ESC STATUS: Connected";
+      getMusic();
     }
     return true;
 
