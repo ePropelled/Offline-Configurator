@@ -26,6 +26,8 @@
 #include <QElapsedTimer>
 #include <QDebug>
 #include <QtGlobal>
+#include <QSharedPointer>
+#include <QStringList>
 
 Widget::Widget(QWidget *parent)
     : QWidget(parent), ui(new Ui::Widget), four_way(new FourWayIF), RL(new BF_ROOTLOADER),
@@ -36,6 +38,12 @@ Widget::Widget(QWidget *parent)
       eeprom_buffer(new QByteArray),
       music_buffer(new QByteArray) {
   ui->setupUi(this);
+  // Automatic ESC connection retry
+  m_connectRetryTimer = new QTimer(this);
+  m_connectRetryTimer->setSingleShot(true);
+
+  connect(m_connectRetryTimer, &QTimer::timeout,
+          this, &Widget::tryMotorConnection);
   // V19 bootloader keepalive workaround
   m_keepAliveTimer = new QTimer(this);
   m_keepAliveTimer->setInterval(3000);
@@ -63,9 +71,14 @@ Widget::Widget(QWidget *parent)
               qInfo() << "[KEEPALIVE] Enabled";
             }
           });
+
+  // Requested end-user default. This only checks the UI; the timer does not
+  // start until an ESC has been initialised successfully.
+  ui->keepAliveCheckBox->setChecked(true);
+
   // ui->tabWidget->removeTab(4); // todo make these visible
   ui->tabWidget->removeTab(5);  // remove led tab for now
-  this->setWindowTitle("ESC Config Tool 1.97 - For firmware version 2.21 and higher");
+  this->setWindowTitle("ESC Config Tool 1.97 - Beta-Test");
 
   serialInfoStuff();
 
@@ -340,6 +353,7 @@ QByteArray Widget::buildBufferFromUi(const QByteArray &base) {
 void Widget::on_sendButton_clicked() { connectSerial(); }
 
 void Widget::closeSerialPort() {
+  m_connectRetryActive = false;
   if (m_serial->isOpen())
     m_serial->close();
   showStatusMessage(tr("Disconnected"));
@@ -435,19 +449,154 @@ void Widget::connectSerial() {
                           .arg(m_serial->flowControl()));
 
     hide4wayButtons(false);
-    QByteArray passthroughenable2;  // payload  empty here
-    four_way->passthrough_started = true;
-
+    QByteArray passthroughenable2; // empty MSP payload
+    four_way->passthrough_started = four_way->direct;
     four_way->ack_required = false;
-    if (four_way->direct == false) {
+
+    if (!four_way->direct) {
       parseMSPMessage = true;
       send_mspCommand(0x68, passthroughenable2);
       m_serial->waitForBytesWritten(100);
       while (m_serial->waitForReadyRead(100)) {
       }
       readData();
+
+      // MSP_SET_4WAY_IF (0xF5) responds with the number of FC motor outputs.
+      // In the existing code these seven bytes were left in the serial buffer
+      // and sometimes produced a false four-way CRC error on the first ESC.
       send_mspCommand(0xf5, passthroughenable2);
-      m_serial->waitForBytesWritten(100);
+      if (!m_serial->waitForBytesWritten(200)) {
+        qWarning() << "[SCAN] Failed to transmit MSP 0xF5";
+        ui->escStatusLabel->setText("FC passthrough TX failed");
+        return;
+      }
+
+      QByteArray mspRx;
+      int motorCount = -1;
+      QElapsedTimer mspWait;
+      mspWait.start();
+      const QByteArray mspHeader = QByteArray::fromHex("244d3e01f5");
+
+      while (mspWait.elapsed() < 600 && motorCount < 0) {
+        mspRx.append(m_serial->readAll());
+        // Valid MSP v1 frame: '$M>' LEN=1 CMD=0xF5 MOTOR_COUNT XOR.
+        // Search within the buffer in case another MSP frame precedes it.
+        for (int pos = 0; pos + 7 <= mspRx.size(); ++pos) {
+          if (mspRx.mid(pos, 5) != mspHeader)
+            continue;
+          const quint8 n = static_cast<quint8>(mspRx.at(pos + 5));
+          const quint8 receivedCrc =
+              static_cast<quint8>(mspRx.at(pos + 6));
+          if (receivedCrc == static_cast<quint8>(0x01 ^ 0xf5 ^ n)) {
+            motorCount = n;
+            break;
+          }
+        }
+        if (motorCount >= 0)
+          break;
+        m_serial->waitForReadyRead(50);
+      }
+
+      if (motorCount <= 0) {
+        qWarning() << "[SCAN] MSP 0xF5 acknowledgement missing/invalid:"
+                   << mspRx.toHex(' ');
+        ui->escStatusLabel->setText("FC passthrough not confirmed");
+        return;
+      }
+
+      four_way->passthrough_started = true;
+      const int scanCount = qMin(motorCount, 4); // UI currently has M1-M4
+      qInfo() << "[SCAN] FC reports" << motorCount
+              << "motor outputs; scanning" << scanCount;
+
+      // Scan each FC output once.  QTimer(0) returns control to Qt between
+      // attempts.  No extra declarations in widget.h are necessary.
+      m_connectRetryTimer->stop();
+      m_keepAliveTimer->stop();
+      m_connectRetryActive = true;
+      ui->tabWidget->setEnabled(false); // prevent concurrent Save/Flash/etc.
+
+      auto nextMotor = QSharedPointer<int>::create(0);
+      auto lastFound = QSharedPointer<int>::create(-1);
+      auto foundNames = QSharedPointer<QStringList>::create();
+      QTimer *scanTimer = new QTimer(this);
+      scanTimer->setSingleShot(true);
+
+      connect(scanTimer, &QTimer::timeout, this,
+              [this, scanTimer, nextMotor, lastFound, foundNames, scanCount]() {
+        // Disconnect cancels scanning via m_connectRetryActive.
+        if (!m_connectRetryActive || !m_serial->isOpen() ||
+            !four_way->passthrough_started) {
+          m_connectRetryActive = false;
+          ui->tabWidget->setEnabled(true);
+          scanTimer->deleteLater();
+          return;
+        }
+
+        if (*nextMotor < scanCount) {
+          const int motor = (*nextMotor)++;
+          qInfo() << "[SCAN] Probing M" << (motor + 1);
+          ui->escStatusLabel->setText(
+              QString("Scanning M%1 of %2 ...")
+                  .arg(motor + 1).arg(scanCount));
+
+          const bool connected = connectMotor(static_cast<uint8_t>(motor));
+          // connectMotor() starts its keepalive after a successful read; pause
+          // that timer while probing the remaining outputs.
+          m_keepAliveTimer->stop();
+          if (connected) {
+            *lastFound = motor;
+            foundNames->append(QString("M%1").arg(motor + 1));
+            qInfo() << "[SCAN] ESC found on M" << (motor + 1);
+          } else {
+            qInfo() << "[SCAN] No settings read on M" << (motor + 1);
+          }
+          // Allow the FC output to settle before probing the next motor.
+          qInfo() << "[SCAN] Waiting 250 ms before next output";
+          scanTimer->start(5);
+          return;
+        }
+
+        m_connectRetryActive = false;
+        if (*lastFound < 0) {
+          ui->tabWidget->setEnabled(true);
+          ui->escStatusLabel->setText(
+              "No ESC detected - use motor buttons to retry");
+          qWarning() << "[SCAN] No ESC detected on first scan";
+          scanTimer->deleteLater();
+          return;
+        }
+
+        // A later unsuccessful probe clears ESC_connected; restore the last
+        // detected ESC so the UI, four-way session and keepalive target agree.
+        bool selectedReady = four_way->ESC_connected &&
+                             four_way->connected_motor == *lastFound;
+        if (!selectedReady) {
+          qInfo() << "[SCAN] Reselecting M" << (*lastFound + 1);
+          selectedReady = connectMotor(static_cast<uint8_t>(*lastFound));
+        }
+
+        if (selectedReady) {
+          ui->MotorLabel->setText(QString("M%1:").arg(*lastFound + 1));
+          ui->escStatusLabel->setText(
+              QString("Found %1 | Selected M%2")
+                  .arg(foundNames->join(", "))
+                  .arg(*lastFound + 1));
+          if (ui->keepAliveCheckBox->isChecked()) {
+            m_keepAliveTimer->start();
+            qInfo() << "[KEEPALIVE] Started for M" << (*lastFound + 1);
+          }
+        } else {
+          ui->escStatusLabel->setText(
+              "ESC(s) found, but selecting ESC failed - retry manually");
+        }
+
+        ui->tabWidget->setEnabled(true);
+        qInfo() << "[SCAN] Finished, detected:" << *foundNames;
+        scanTimer->deleteLater();
+      });
+      // Short pause after MSP passthrough acknowledgement.
+      scanTimer->start(5);
     }
 
   } else {
@@ -458,6 +607,10 @@ void Widget::connectSerial() {
 }
 
 void Widget::on_disconnectButton_clicked() {
+  ui->tabWidget->setEnabled(true); // also cancel any automatic scan UI lock
+  m_keepAliveTimer->stop();
+  m_connectRetryActive = false;
+  m_connectRetryTimer->stop();
   m_keepAliveTimer->stop();
   if (m_serial->isOpen()) {
     hide4wayButtons(true);
@@ -1266,7 +1419,15 @@ bool Widget::connectMotor(uint8_t motor) {
       m_serial->read(mspAck.size());
     }
     four_way->ack_required = true;
-    writeData(four_way->makeFourWayCommand(0x37, motor));
+    four_way->ESC_connected = false;
+    QByteArray command =
+        four_way->makeFourWayCommand(0x37, motor);
+
+    qInfo() << "[CONNECT] Motor:" << int(motor + 1)
+            << "Index:" << int(motor)
+            << "TX:" << command.toHex(' ');
+
+    writeData(command);
     m_serial->waitForBytesWritten(200);
     while (m_serial->waitForReadyRead(200)) {
     }
@@ -1385,7 +1546,8 @@ bool Widget::connectMotor(uint8_t motor) {
 
       four_way->connected_motor = motor;
 
-      if (ui->keepAliveCheckBox->isChecked()) {
+      if (ui->keepAliveCheckBox->isChecked() &&
+          !m_connectRetryActive) {
         m_keepAliveTimer->start();
 
         qInfo() << "[KEEPALIVE] Started for motor"
@@ -1455,6 +1617,7 @@ void Widget::showSingleMotor(bool tf) {
 }
 
 void Widget::on_initMotor1_clicked() {
+  if (m_connectRetryActive) return; // automatic discovery in progress
   allup();
   if (four_way->direct) {
     ui->initMotor1->setDown(true);
@@ -1492,6 +1655,7 @@ void Widget::on_initMotor1_clicked() {
 }
 
 void Widget::on_initMotor2_clicked() {
+  if (m_connectRetryActive) return; // automatic discovery in progress
   allup();
   ui->initMotor2->setFlat(true);
   ui->initMotor2_2->setFlat(true);
@@ -1522,6 +1686,7 @@ void Widget::on_initMotor2_clicked() {
 }
 
 void Widget::on_initMotor3_clicked() {
+  if (m_connectRetryActive) return; // automatic discovery in progress
   allup();
   ui->initMotor3->setFlat(true);
   ui->initMotor3_2->setFlat(true);
@@ -1552,35 +1717,37 @@ void Widget::on_initMotor3_clicked() {
   //  }
 }
 
-void Widget::on_initMotor4_clicked() {
+void Widget::on_initMotor4_clicked()
+{
+  if (m_connectRetryActive)
+    return;
+
   allup();
+
   ui->initMotor4->setFlat(true);
   ui->initMotor4_2->setFlat(true);
   ui->initMotor4_3->setFlat(true);
+
   ui->MotorLabel->setText("M4:");
-  if (connectMotor(0x03)) {
-    ui->escStatusLabel->setText("M4:Connected: Settings read OK ");
-    four_way->connected_motor = 0x03;
-    return;
-  } else {
-    ui->escStatusLabel->setText("M4:Did not connect - retrying ");
-    ui->StatusLabel->setText("Connecting");
-  }
+
+  qInfo() << "[M4] Starting DeviceInitFlash";
 
   if (connectMotor(0x03)) {
-    ui->escStatusLabel->setText("M4:Connected: Settings read OK ");
+
+    ui->escStatusLabel->setText(
+        "M4: Connected: Settings read OK");
+
     four_way->connected_motor = 0x03;
+
+    qInfo() << "[M4] Connection successful";
+
   } else {
-    ui->escStatusLabel->setText("M4:Did not connect");
+
+    ui->escStatusLabel->setText(
+        "M4: Did not connect");
+
+    qInfo() << "[M4] Connection failed";
   }
-  //  timerdone = false;
-  //  QTimer::singleShot(1200, this, &Widget::endTimer);
-  //  four_way->connected_motor = 0x03;
-  //  four_way->ack_required = true;
-  //  writeData(four_way->makeFourWayCommand(0x37, 0x03));
-  //  m_serial->waitForBytesWritten(200);
-  //  while (m_serial->waitForReadyRead(100)) {
-  //  }
 }
 
 void Widget::sendDirect(const QByteArray sendbuffer, uint16_t buffer_size,
@@ -2000,6 +2167,109 @@ void Widget::sendKeepAlive()
     ui->StatusLabel->setText(
         "Keepalive lost - reconnect ESC");
   }
+}
+void Widget::startMotorConnection(uint8_t motor)
+{
+  if (m_connectRetryActive)
+    return;
+
+  if (!m_serial->isOpen() ||
+      !four_way->passthrough_started ||
+      four_way->direct) {
+    qWarning() << "[CONNECT] FC passthrough not ready";
+    return;
+  }
+
+          // Suspend keepalive during connection attempts
+  m_keepAliveTimer->stop();
+
+  m_requestedMotor = motor;
+  m_connectAttempt = 0;
+  m_connectRetryActive = true;
+
+  qInfo() << "[CONNECT] Starting motor"
+          << (motor + 1);
+
+  m_connectRetryTimer->start(0);
+}
+
+
+void Widget::tryMotorConnection()
+{
+  constexpr int MAX_ATTEMPTS = 12;
+  constexpr int RETRY_DELAY_MS = 300;
+
+  if (!m_connectRetryActive)
+    return;
+
+  if (!m_serial->isOpen() ||
+      !four_way->passthrough_started) {
+    m_connectRetryActive = false;
+    m_connectRetryTimer->stop();
+    return;
+  }
+
+  ++m_connectAttempt;
+
+  qInfo() << "[CONNECT] Motor"
+          << (m_requestedMotor + 1)
+          << "Attempt"
+          << m_connectAttempt
+          << "of"
+          << MAX_ATTEMPTS;
+
+  ui->escStatusLabel->setText(
+      QString("M%1: Connecting (%2/%3)")
+          .arg(m_requestedMotor + 1)
+          .arg(m_connectAttempt)
+          .arg(MAX_ATTEMPTS));
+
+          // Existing connection and EEPROM reading function
+  const bool success = connectMotor(m_requestedMotor);
+
+          // The user may have disconnected during processing
+  if (!m_connectRetryActive || !m_serial->isOpen())
+    return;
+
+  if (success) {
+
+    m_connectRetryActive = false;
+    four_way->connected_motor = m_requestedMotor;
+
+    qInfo() << "[CONNECT] SUCCESS on attempt"
+            << m_connectAttempt;
+
+    ui->escStatusLabel->setText(
+        QString("M%1: Connected - Settings read OK")
+            .arg(m_requestedMotor + 1));
+
+            // Resume keepalive after successful connection
+    if (ui->keepAliveCheckBox->isChecked() &&
+        !four_way->direct &&
+        !m_keepAliveTimer->isActive()) {
+      m_keepAliveTimer->start();
+    }
+
+    return;
+  }
+
+  if (m_connectAttempt >= MAX_ATTEMPTS) {
+
+    m_connectRetryActive = false;
+
+    qWarning() << "[CONNECT] Failed after"
+               << MAX_ATTEMPTS << "attempts";
+
+    ui->escStatusLabel->setText(
+        QString("M%1: Connection failed after %2 attempts")
+            .arg(m_requestedMotor + 1)
+            .arg(MAX_ATTEMPTS));
+
+    return;
+  }
+
+          // Schedule the next attempt without blocking the UI
+  m_connectRetryTimer->start(RETRY_DELAY_MS);
 }
 void Widget::on_m1MSPSlider_valueChanged(int value) {
   QString s = QString::number(value);

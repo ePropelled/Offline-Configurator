@@ -235,6 +235,10 @@ class Widget : public QWidget {
   //    void initActionsConnections();
 
  private:
+  QTimer *m_connectRetryTimer = nullptr;
+  bool m_connectRetryActive = false;
+  uint8_t m_requestedMotor = 0;
+  int m_connectAttempt = 0;
   QTimer *m_keepAliveTimer = nullptr;
   Ui::Widget *ui;
   std::vector<EepromField> eepromFieldTable();
@@ -263,6 +267,8 @@ class Widget : public QWidget {
   bool writeMusic();
   void endTimer();
   void sendKeepAlive();
+  void startMotorConnection(uint8_t motor);
+  void tryMotorConnection();
   typedef union __attribute__((packed)) {
     uint8_t bytes[2];
     uint16_t word;
